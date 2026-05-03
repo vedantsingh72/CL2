@@ -1,4 +1,4 @@
-import { exec } from "child_process";
+import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 
@@ -8,25 +8,46 @@ type PackageJson = {
   devDependencies?: Record<string, string>;
 };
 
-function runCommand(command: string, cwd: string) {
+function runCommand(command: string, cwd: string, envPatch?: Record<string, string>) {
   return new Promise<void>((resolve, reject) => {
-    const child = exec(command, { cwd });
+    const child = spawn(command, {
+      cwd,
+      shell: true,
+      env: {
+        ...process.env,
+        CI: "true",
+        ...envPatch
+      }
+    });
+    const startedAt = Date.now();
 
-    child.stdout?.on("data", (data) => {
+    // Render logs can look "stuck" for long installs; print heartbeat.
+    const heartbeat = setInterval(() => {
+      const elapsedSec = Math.floor((Date.now() - startedAt) / 1000);
+      console.log(`[build-worker] still running "${command}" in ${cwd} (${elapsedSec}s)`);
+    }, 15000);
+
+    child.stdout.on("data", (data) => {
       console.log(data.toString());
     });
 
-    child.stderr?.on("data", (data) => {
+    child.stderr.on("data", (data) => {
       console.error(data.toString());
     });
 
     child.on("close", (code) => {
+      clearInterval(heartbeat);
       if (code === 0) {
         resolve();
         return;
       }
 
       reject(new Error(`${command} failed in ${cwd} with exit code ${code}`));
+    });
+
+    child.on("error", (err) => {
+      clearInterval(heartbeat);
+      reject(new Error(`${command} failed to start in ${cwd}: ${err.message}`));
     });
   });
 }
@@ -159,8 +180,13 @@ export async function buildProject(id: string) {
       ensureNextStaticExport(reactProjectDir);
     }
 
-    console.log("Installing React app dependencies in:", reactProjectDir);
-    await runCommand("npm install", reactProjectDir);
+    console.log("Installing React app dependencies (including devDependencies) in:", reactProjectDir);
+    // Render sets NODE_ENV=production, which skips devDependencies unless we override.
+    // Works across npm versions (older npm may not support --include=dev).
+    await runCommand("npm install --no-audit --no-fund", reactProjectDir, {
+      NODE_ENV: "development",
+      NPM_CONFIG_PRODUCTION: "false"
+    });
 
     console.log("Converting React app to static HTML, CSS, and JS in:", reactProjectDir);
     await runCommand("npm run build", reactProjectDir);
